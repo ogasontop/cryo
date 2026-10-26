@@ -137,6 +137,15 @@ def quote_path(rel):
     return urllib.parse.quote(rel.strip("/"), safe="")
 
 
+def file_ext(path):
+    name = path.rsplit("/", 1)[-1].lower()
+    for multi in (".tar.gz", ".tar.bz2", ".tar.xz"):
+        if name.endswith(multi):
+            return multi
+    dot = name.rfind(".")
+    return name[dot:] if 0 < dot < len(name) - 1 else "(none)"
+
+
 _TS_FRAC = re.compile(r"\.\d+")
 _TS_TZ = re.compile(r"([+-]\d\d):(\d\d)$")
 
@@ -179,6 +188,8 @@ class Scan:
         self.bucket_files = [0] * len(BUCKETS)
         self.bucket_bytes = [0] * len(BUCKETS)
         self.by_dir = {}
+        self.by_ext = {}
+        self.by_year = {}
         self.errors, self.error_count = [], 0
         self.rows = []
         self.root_style = ""
@@ -314,6 +325,12 @@ class Scan:
                 d = self.by_dir.setdefault(key, [0, 0])
                 d[0] += 1
                 d[1] += size
+                xt = self.by_ext.setdefault(file_ext(path), [0, 0])
+                xt[0] += 1
+                xt[1] += size
+                yr = self.by_year.setdefault(str(m.year) if m else "unknown", [0, 0])
+                yr[0] += 1
+                yr[1] += size
                 m_age = (self.now - m).days if m else -1
                 a_age = (self.now - a).days if a else -1
                 a_s = a.isoformat() if a else ""
@@ -331,6 +348,8 @@ class Scan:
             end = self.finished or time.time()
             el = max(end - self.started, 0.001)
             top = sorted(self.by_dir.items(), key=lambda kv: kv[1][1], reverse=True)[:30]
+            types = sorted(self.by_ext.items(), key=lambda kv: kv[1][1], reverse=True)[:12]
+            years = sorted(self.by_year.items())
             return {
                 "state": self.state, "message": self.message, "elapsed": el,
                 "dirs": self.dirs, "files": self.files, "cold_files": self.cold_files,
@@ -341,6 +360,8 @@ class Scan:
                 "buckets": [{"label": BUCKETS[i][0], "files": self.bucket_files[i],
                              "bytes": self.bucket_bytes[i]} for i in range(len(BUCKETS))],
                 "top_dirs": [{"path": k, "files": v[0], "bytes": v[1]} for k, v in top],
+                "types": [{"ext": k, "files": v[0], "bytes": v[1]} for k, v in types],
+                "years": [{"year": k, "files": v[0], "bytes": v[1]} for k, v in years],
                 "errors": self.errors[-100:], "error_count": self.error_count,
                 "csv": self.csv_name, "config": {k: v for k, v in self.cfg.items()},
                 "rows_truncated": self.cold_files > len(self.rows),
@@ -584,6 +605,8 @@ td.p{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font
 .presets{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px}.presets button{padding:4px 10px;font-size:13px}
 .sortrow{display:flex;gap:8px;margin-bottom:6px;align-items:center}.sortrow span{width:58px;color:var(--mute);font-size:13px}.sortrow select{flex:1}
 .filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:2px 10px;margin-bottom:12px}.filters label{margin:6px 0 3px}
+.cgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px}.cgrid h2{margin:0 0 6px}.cwide{grid-column:1/-1}
+.ch{width:100%;height:auto;display:block}.ch text{fill:var(--ink);font-size:12px}.ch .m{fill:var(--mute);font-size:11px}.ch .tt{fill:var(--panel);font-weight:600}
 .pager{display:flex;gap:10px;align-items:center;margin-top:10px;color:var(--mute);font-size:13px}
 </style></head><body>
 <header><h1>Cryo</h1><span class="hint" style="margin:0">Cold data finder</span><span id="pill" class="pill">idle</span><span id="hdrmsg" class="hint" style="margin:0"></span></header>
@@ -624,7 +647,7 @@ td.p{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font
   </div>
   <div class="panel">
     <div class="tabs" id="tabs">
-      <button data-t="summary" class="on">Summary</button><button data-t="files">Files</button>
+      <button data-t="summary" class="on">Summary</button><button data-t="charts">Charts</button><button data-t="files">Files</button>
       <button data-t="errors">Errors <span id="errc"></span></button><button data-t="history">Saved scans</button>
     </div>
     <div id="tab_summary">
@@ -632,6 +655,7 @@ td.p{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font
       <h2>Cold data by age</h2><div class="tbl"><table id="buckets"></table></div>
       <h2 style="margin-top:20px">Largest cold folders</h2><div class="tbl"><table id="topdirs"></table></div>
     </div>
+    <div id="tab_charts" style="display:none"><div id="charts"></div></div>
     <div id="tab_files" style="display:none">
       <input id="fq" placeholder="Filter by path" style="margin-bottom:6px">
       <div class="filters">
@@ -688,8 +712,63 @@ $("btnStart").onclick=async()=>{
 $("btnStop").onclick=async()=>{try{await api("/api/scan/stop",{});say("scanmsg","Stopping after the current folders finish...")}catch(e){say("scanmsg",e.message,"bad")}};
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{tab=b.dataset.t;
   document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));
-  ["summary","files","errors","history"].forEach(t=>$("tab_"+t).style.display=t===tab?"block":"none");
-  if(tab==="files")loadFiles();if(tab==="history")loadHistory()});
+  ["summary","charts","files","errors","history"].forEach(t=>$("tab_"+t).style.display=t===tab?"block":"none");
+  if(tab==="files")loadFiles();if(tab==="history")loadHistory();if(tab==="charts")drawCharts(LAST)});
+let LAST=null;
+function treemap(items,x,y,w,h,out){
+  if(!items.length)return;
+  if(items.length===1){out.push(Object.assign({},items[0],{x:x,y:y,w:w,h:h}));return}
+  const tot=items.reduce((a,i)=>a+i.v,0);let k=1,acc=items[0].v;
+  while(k<items.length-1&&acc<tot/2){acc+=items[k].v;k++}
+  const A=items.slice(0,k),B=items.slice(k);
+  if(w>=h){const wa=w*acc/tot;treemap(A,x,y,wa,h,out);treemap(B,x+wa,y,w-wa,h,out)}
+  else{const ha=h*acc/tot;treemap(A,x,y,w,ha,out);treemap(B,x,y+ha,w,h-ha,out)}
+}
+function vbars(items,label){
+  if(!items.length)return '<div class="empty">No data yet.</div>';
+  const n=items.length,W=Math.max(420,n*46),H=210,top=22,bot=30,step=(W-20)/n,bw=Math.min(44,step-8),mx=Math.max(1,...items.map(i=>i.v));
+  return `<svg class="ch" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">`+items.map((it,i)=>{
+    const h=(H-top-bot)*it.v/mx,x=10+i*step+(step-bw)/2,y=H-bot-h;
+    return `<g><title>${esc(it.t)}</title><rect x="${x}" y="${y}" width="${bw}" height="${Math.max(h,1)}" rx="2" fill="var(--ice)"/>`+
+      (step>=60?`<text x="${x+bw/2}" y="${y-5}" text-anchor="middle" class="m">${fmtB(it.v)}</text>`:"")+
+      `<text x="${x+bw/2}" y="${H-12}" text-anchor="middle">${esc(it.l)}</text></g>`}).join("")+"</svg>";
+}
+function hbars(items){
+  const mx=Math.max(1,...items.map(i=>i.v)),rh=26,W=560,lw=78,rw=150;
+  return `<svg class="ch" viewBox="0 0 ${W} ${items.length*rh+4}" role="img" aria-label="Cold size by file type">`+items.map((it,i)=>{
+    const y=i*rh+2,bw=(W-lw-rw)*it.v/mx;
+    const attr=it.ext&&it.ext.charAt(0)==="."?` data-ext="${esc(it.ext)}" style="cursor:pointer"`:"";
+    return `<g${attr}><title>${esc(it.t)}</title><text x="0" y="${y+16}">${esc(it.l)}</text><rect x="${lw}" y="${y+4}" width="${Math.max(bw,1)}" height="14" rx="2" fill="var(--ice)"/><text x="${lw+bw+6}" y="${y+16}" class="m">${fmtB(it.v)} · ${fmtN(it.f)} files</text></g>`}).join("")+"</svg>";
+}
+function goFiles(path,ext){$("fq").value=path;$("fext").value=ext;page=0;document.querySelector('#tabs button[data-t="files"]').click()}
+function drawCharts(s){
+  const el=$("charts");
+  if(!s||!s.buckets||!s.files){el.innerHTML='<div class="empty">Start a scan to see charts.</div>';return}
+  const tot=s.total_bytes||0,cold=s.cold_bytes||0,pct=tot?cold/tot:0,C=2*Math.PI*70;
+  const donut=`<svg class="ch" viewBox="0 0 260 190" role="img" aria-label="Cold share of scanned data"><circle cx="95" cy="95" r="70" fill="none" stroke="var(--line)" stroke-width="24"/><circle cx="95" cy="95" r="70" fill="none" stroke="var(--ice)" stroke-width="24" stroke-dasharray="${pct*C} ${C}" transform="rotate(-90 95 95)"/><text x="95" y="93" text-anchor="middle" style="font-size:24px;font-weight:650">${(pct*100).toFixed(1)}%</text><text x="95" y="113" text-anchor="middle" class="m">cold by size</text><rect x="182" y="70" width="10" height="10" rx="2" fill="var(--ice)"/><text x="198" y="79">Cold</text><text x="198" y="94" class="m">${fmtB(cold)}</text><rect x="182" y="112" width="10" height="10" rx="2" fill="var(--line)"/><text x="198" y="121">Not cold</text><text x="198" y="136" class="m">${fmtB(Math.max(0,tot-cold))}</text></svg>`;
+  const age=vbars(s.buckets.map(b=>({l:b.label,v:b.bytes,t:b.label+": "+fmtB(b.bytes)+", "+fmtN(b.files)+" files"})),"Cold size by age");
+  const yrs=vbars((s.years||[]).map(y=>({l:y.year,v:y.bytes,t:y.year+": "+fmtB(y.bytes)+", "+fmtN(y.files)+" files"})),"Cold size by year last modified");
+  const dirs=(s.top_dirs||[]).filter(d=>d.bytes>0).map(d=>({v:d.bytes,path:d.path,files:d.files}));
+  const rest=cold-dirs.reduce((a,d)=>a+d.v,0);
+  if(rest>cold*0.005)dirs.push({v:rest,path:"",files:0,other:1});
+  dirs.sort((a,b)=>b.v-a.v);dirs.forEach((d,i)=>{d.rank=i});
+  const out=[];treemap(dirs,0,0,700,300,out);
+  const tree=dirs.length?`<svg class="ch" viewBox="0 0 700 300" role="img" aria-label="Cold size by folder">`+out.map(t=>{
+    const name=t.other?"All other folders":t.path,mc=Math.floor((t.w-14)/7),lab=name.length>mc?"…"+name.slice(-(mc-1)):name;
+    const fill=t.other?'fill="var(--line)"':`fill="var(--ice)" fill-opacity="${(0.7+0.3*(1-t.rank/Math.max(1,dirs.length-1))).toFixed(2)}"`;
+    const tcls=t.other?"":' class="tt"';
+    const attr=t.other?"":` data-path="${esc(t.path)}" style="cursor:pointer"`;
+    return `<g${attr}><title>${esc(name)}\n${fmtB(t.v)}${t.files?", "+fmtN(t.files)+" files":""}</title><rect x="${t.x}" y="${t.y}" width="${t.w}" height="${t.h}" ${fill} stroke="var(--panel)" stroke-width="2"/>`+
+      (t.w>60&&t.h>36&&mc>3?`<text x="${t.x+8}" y="${t.y+18}"${tcls}>${esc(lab)}</text><text x="${t.x+8}" y="${t.y+34}"${tcls} style="font-weight:400">${fmtB(t.v)}</text>`:"")+"</g>"}).join("")+"</svg>":'<div class="empty">No cold files found yet.</div>';
+  const ty=(s.types||[]).slice(0,10).map(t=>({l:t.ext,ext:t.ext,v:t.bytes,f:t.files,t:t.ext+": "+fmtB(t.bytes)+", "+fmtN(t.files)+" files"}));
+  const trest=cold-ty.reduce((a,t)=>a+t.v,0),frest=(s.cold_files||0)-ty.reduce((a,t)=>a+t.f,0);
+  if(trest>cold*0.005)ty.push({l:"other",v:trest,f:Math.max(frest,0),t:"All other file types"});
+  const types=ty.length?hbars(ty):'<div class="empty">No data yet.</div>';
+  el.innerHTML=`<div class="cgrid"><div><h2>Cold versus the rest</h2>${donut}</div><div><h2>Cold data by age</h2>${age}</div>`+
+    `<div class="cwide"><h2>Where the cold data is</h2><div class="hint" style="margin:0 0 6px">Box size is cold size. Click a box to list its files.</div>${tree}</div>`+
+    `<div><h2>By file type</h2><div class="hint" style="margin:0 0 6px">Click a bar to list those files.</div>${types}</div><div><h2>By year last modified</h2>${yrs}</div></div>`;
+}
+$("charts").onclick=e=>{const g=e.target.closest("[data-path],[data-ext]");if(g)goFiles(g.dataset.path||"",g.dataset.ext||"")};
 function emptyRow(cols,text){return `<tr><td colspan="${cols}" class="empty">${text}</td></tr>`}
 function render(s){
   const run=s.state==="running"||s.state==="starting";
@@ -697,6 +776,7 @@ function render(s){
   $("btnStart").disabled=run;$("btnStop").disabled=!run;
   $("hdrmsg").textContent=s.message||"";
   if(s.state==="idle")return;
+  LAST=s;if(tab==="charts")drawCharts(s);
   $("t_dirs").textContent=fmtN(s.dirs);$("t_files").textContent=fmtN(s.files);
   $("t_cold").textContent=fmtN(s.cold_files);$("t_coldb").textContent=fmtB(s.cold_bytes);
   $("t_pct").textContent=s.total_bytes?("cold size, "+(100*s.cold_bytes/s.total_bytes).toFixed(1)+"% of "+fmtB(s.total_bytes)):"cold size";
